@@ -4,7 +4,7 @@ const app = document.querySelector('#app')
 const dialog = document.querySelector('#dialog')
 const logout = document.querySelector('#logout')
 const toast = document.querySelector('#toast')
-const storageKey = 'migraine-mri-appointments-v1'
+const endpoint = 'https://zxbhvzfemuuhlhzducye.supabase.co/functions/v1/appointments'
 const dayMs = 86400000
 const periods = [
   { label: '18:00–19:00', start: '18:00', end: '19:00' },
@@ -16,6 +16,11 @@ const fields = [
 ]
 const state = { unlocked: false, tab: 'book', week: 0, month: 0, history: false }
 let activeDialogId
+let detailSnapshot
+let session = ''
+let cachedRecords = []
+let refreshSequence = 0
+let busy = false
 let toastTimer
 
 function esc(value = '') {
@@ -23,20 +28,47 @@ function esc(value = '') {
   return String(value ?? '').replace(/[&<>"']/g, letter => entities[letter])
 }
 
-function records() {
-  return JSON.parse(localStorage.getItem(storageKey) || '[]')
-}
+function records() { return cachedRecords.slice() }
 
-function save(all) {
-  localStorage.setItem(storageKey, JSON.stringify(all))
-}
-
-function update(record) {
-  const all = records()
-  if (all.some(item => item.id !== record.id && item.date === record.date && item.period === record.period)) {
-    throw new Error('该时段已被预约，请重新选择。')
+async function request(action, payload = {}) {
+  const usedSession = session
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-mri-session': usedSession },
+    body: JSON.stringify({ action, ...payload }),
+    cache: 'no-store',
+    signal: AbortSignal.timeout(12000)
+  })
+  const result = await response.json().catch(() => ({}))
+  if (response.status === 401 && action !== 'login' && session === usedSession) lock()
+  if (!response.ok) {
+    const error = new Error(result.error || '后台暂不可用，请检查部署设置。')
+    error.status = response.status
+    throw error
   }
-  save([...all.filter(item => item.id !== record.id), record])
+  return result
+}
+
+async function refresh() {
+  const sequence = ++refreshSequence
+  const result = await request('list')
+  if (sequence !== refreshSequence || !state.unlocked) return
+  if (!Array.isArray(result.records)) throw new Error('后台返回的数据无效。')
+  cachedRecords = result.records
+}
+
+async function update(record, revision) {
+  await request('save', { id: record.id, revision, item: record })
+}
+
+async function refreshAfterSave() {
+  try {
+    await refresh()
+    return true
+  } catch {
+    notice('后台已保存，列表暂未刷新。')
+    return false
+  }
 }
 
 function cnToday() { return new Date(Date.now() + 8 * 3600000) }
@@ -60,6 +92,18 @@ function formatBirth(value) {
 }
 
 function notice(message) {
+  if (dialog.open) {
+    let messageBox = dialog.querySelector('[data-notice]')
+    if (!messageBox) {
+      messageBox = document.createElement('p')
+      messageBox.dataset.notice = ''
+      messageBox.className = 'error'
+      messageBox.setAttribute('role', 'alert')
+      dialog.append(messageBox)
+    }
+    messageBox.textContent = message
+    return
+  }
   toast.textContent = message
   toast.hidden = false
   clearTimeout(toastTimer)
@@ -157,8 +201,8 @@ function render() {
   logout.hidden = !state.unlocked
   if (!state.unlocked) {
     app.innerHTML = `<div class="login"><div class="hero"><h1>磁共振预约</h1></div><form class="panel" data-form="access">
-      <h2>访问验证</h2><label class="field">访问密码<input name="password" type="password" required autocomplete="current-password" placeholder="请输入访问密码"></label>
-      <p class="error" role="alert" hidden>密码错误，无法进入。</p><button class="primary">验证并进入</button>
+      <h2>访问验证</h2><label class="field">团队口令<input name="password" type="password" required autocomplete="current-password" placeholder="请输入团队口令"></label>
+      <p class="error" role="alert" hidden>口令错误，无法进入。</p><button class="primary">验证并进入</button>
     </form></div>`
     return
   }
@@ -179,6 +223,7 @@ function detail(id) {
   const item = recordFor(id)
   if (!item) return
   activeDialogId = id
+  detailSnapshot = item
   const phone = String(item.phone || '').replace(/[^0-9+]/g, '')
   const rows = fields.filter(([name]) => name !== 'name').map(([name, label]) => {
     const value = name === 'birth' ? formatBirth(item.birth) : item[name]
@@ -202,6 +247,7 @@ function resetBooking() {
   delete state.slot
   delete state.draft
   delete state.rescheduleId
+  delete state.rescheduleRevision
 }
 
 function captureDraft() {
@@ -209,9 +255,9 @@ function captureDraft() {
   if (form) state.draft = Object.fromEntries(new FormData(form))
 }
 
-document.addEventListener('click', event => {
+document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]')
-  if (!button || !state.unlocked) return
+  if (!button || !state.unlocked || busy) return
   const data = button.dataset
   try {
     switch (data.action) {
@@ -246,6 +292,7 @@ document.addEventListener('click', event => {
         resetBooking()
         state.rescheduleId = item.id
         state.draft = item
+        state.rescheduleRevision = item.revision
         state.tab = 'book'
         state.week = 0
         dialog.close()
@@ -256,45 +303,68 @@ document.addEventListener('click', event => {
         displayDialog('删除预约', '<p>确定删除这条预约吗？删除后无法恢复。</p><div class="actions">' +
           action('back-detail', '取消') + action('delete', '删除预约', 'class="danger"') + '</div>')
         break
-      case 'delete':
-        save(records().filter(item => item.id !== activeDialogId))
+      case 'delete': {
+        busy = true
+        await request('delete', { id: activeDialogId, revision: detailSnapshot.revision })
         dialog.close()
+        if (await refreshAfterSave()) notice('已删除预约')
         render()
-        notice('已删除预约')
         break
+      }
     }
   } catch (error) {
     notice(error.message || '操作失败，请重试。')
+  } finally {
+    busy = false
   }
 })
 
-document.addEventListener('submit', event => {
+document.addEventListener('submit', async event => {
   const form = event.target
   if (!form.dataset.form) return
   event.preventDefault()
+  if (busy) return
   const values = Object.fromEntries(new FormData(form))
   if (form.dataset.form === 'access') {
-    if (values.password !== 'migmribook') {
-      form.querySelector('.error').hidden = false
+    busy = true
+    const submit = form.querySelector('button')
+    submit.disabled = true
+    try {
+      const result = await request('login', { password: values.password })
+      if (!result.token) throw new Error('后台未返回有效会话。')
+      session = result.token
+      state.unlocked = true
+      await refresh()
+      if (state.unlocked) render()
+    } catch (error) {
+      const label = form.querySelector('.error')
+      label.textContent = error.message === 'Failed to fetch'
+        ? '无法连接后台，请检查函数部署和网络。' : error.message
+      label.hidden = false
       form.querySelector('input').setAttribute('aria-invalid', 'true')
-      return
+      session = ''
+      state.unlocked = false
+    } finally {
+      busy = false
+      submit.disabled = false
     }
-    state.unlocked = true
-    render()
     return
   }
   if (!state.unlocked) return
   values.name = values.name.trim()
   if (!values.name) return notice('请输入姓名。')
   if (formatBirth(values.birth) === null) return notice('请输入有效的八位出生日期。')
+  busy = true
+  const button = form.querySelector('button.primary')
+  button.disabled = true
   try {
     if (form.dataset.form === 'edit') {
-      const item = recordFor(activeDialogId)
-      if (!item) return notice('预约记录已不存在。')
-      update({ ...item, ...values })
-      detail(activeDialogId)
-      render()
-      notice('已保存修改')
+      await update({ ...detailSnapshot, ...values }, detailSnapshot.revision)
+      if (await refreshAfterSave()) {
+        detail(activeDialogId)
+        render()
+        notice('已保存修改')
+      }
       return
     }
     if (!state.slot || at(state.slot.date, periods[state.slot.period].start) <= Date.now()) {
@@ -302,18 +372,27 @@ document.addEventListener('submit', event => {
     }
     const previous = state.rescheduleId && recordFor(state.rescheduleId)
     if (state.rescheduleId && !previous) return notice('原预约已不存在。')
-    update({
+    await update({
       ...previous, ...values, ...state.slot,
       id: previous ? previous.id : crypto.randomUUID(),
       attending: false
-    })
+    }, previous ? state.rescheduleRevision : null)
     resetBooking()
     state.tab = 'list'
     state.history = false
+    if (await refreshAfterSave()) notice('已保存预约')
     render()
-    notice('已保存预约')
   } catch (error) {
+    if (error.status === 409 && form.dataset.form === 'booking' && state.unlocked) {
+      captureDraft()
+      delete state.slot
+      try { await refresh() } catch {}
+      render()
+    }
     notice(error.message || '保存失败，请重试。')
+  } finally {
+    button.disabled = false
+    busy = false
   }
 })
 
@@ -328,36 +407,61 @@ document.addEventListener('input', event => {
   help.classList.toggle('error', invalid)
 })
 
-dialog.addEventListener('change', event => {
+dialog.addEventListener('change', async event => {
   const status = event.target.dataset.status
-  if (!state.unlocked || !status) return
-  const item = recordFor(activeDialogId)
-  if (!item) return
+  if (!state.unlocked || !status || !detailSnapshot) return
+  if (busy) {
+    event.target.checked = !event.target.checked
+    return
+  }
+  busy = true
   try {
-    update({ ...item, [status]: event.target.checked })
-    render()
+    await update({ ...detailSnapshot, [status]: event.target.checked }, detailSnapshot.revision)
+    if (await refreshAfterSave()) {
+      detail(activeDialogId)
+      render()
+    }
   } catch (error) {
     event.target.checked = !event.target.checked
     notice(error.message)
+  } finally {
+    busy = false
   }
 })
 
-logout.addEventListener('click', () => {
+function lock() {
   if (dialog.open) dialog.close()
   dialog.replaceChildren()
+  detailSnapshot = null
+  activeDialogId = null
+  session = ''
+  cachedRecords = []
+  refreshSequence += 1
   resetBooking()
   Object.assign(state, { unlocked: false, tab: 'book', history: false, week: 0, month: 0, date: '' })
   render()
-})
+}
 
-let lastMinute
-setInterval(() => {
-  const minute = Math.floor(Date.now() / 60000)
-  if (state.unlocked && state.tab === 'list' && minute !== lastMinute) render()
-  lastMinute = minute
-}, 1000)
+logout.addEventListener('click', () => { if (!busy) lock() })
 
-window.addEventListener('storage', event => {
-  if (event.key === storageKey && state.unlocked && state.tab !== 'book') render()
-})
+let syncing = false
+async function sync() {
+  if (!state.unlocked || busy || syncing || document.hidden) return
+  syncing = true
+  try {
+    const previous = JSON.stringify(cachedRecords)
+    await refresh()
+    const nowMinute = Math.floor(Date.now() / 60000)
+    if (state.unlocked && (previous !== JSON.stringify(cachedRecords) || nowMinute !== sync.lastMinute)
+      && !(state.tab === 'book' && state.slot)) render()
+    sync.lastMinute = nowMinute
+  } catch (error) {
+    if (state.unlocked) notice(error.message || '同步暂不可用。')
+  } finally {
+    syncing = false
+  }
+}
+
+setInterval(sync, 5000)
+document.addEventListener('visibilitychange', sync)
 render()
